@@ -189,7 +189,7 @@ void validate_random_ray_inputs()
 
   // Validate adjoint sources
   ///////////////////////////////////////////////////////////////////
-  if (FlatSourceDomain::adjoint_ && !model::adjoint_sources.empty()) {
+  if (FlatSourceDomain::adjoint_requested_ && !model::adjoint_sources.empty()) {
     for (int i = 0; i < model::adjoint_sources.size(); i++) {
       Source* s = model::adjoint_sources[i].get();
 
@@ -287,9 +287,12 @@ void validate_random_ray_inputs()
 
 void openmc_finalize_random_ray()
 {
-  FlatSourceDomain::volume_estimator_ = RandomRayVolumeEstimator::HYBRID;
+  FlatSourceDomain::volume_estimator_ = RandomRayVolumeEstimator::AUTO;
+  FlatSourceDomain::resolved_volume_estimator_ = RandomRayVolumeEstimator::AUTO;
   FlatSourceDomain::volume_normalized_flux_tallies_ = false;
-  FlatSourceDomain::adjoint_ = false;
+  FlatSourceDomain::adjoint_requested_ = false;
+  FlatSourceDomain::source_gradient_limiter_ = false;
+  FlatSourceDomain::solve_ = RandomRaySolve::FORWARD;
   FlatSourceDomain::fw_cadis_local_ = false;
   FlatSourceDomain::fw_cadis_local_targets_.clear();
   FlatSourceDomain::mesh_domain_map_.clear();
@@ -345,7 +348,19 @@ void RandomRaySimulation::prepare_fw_fixed_sources_adjoint()
   // Prepare adjoint fixed sources using forward flux
   domain_->source_regions_.adjoint_reset();
   if (settings::run_mode == RunMode::FIXED_SOURCE) {
+    // Consumes the accumulated forward flux (and zeroes it as it goes), so
+    // the adjoint solve starts from a clean accumulator.
     domain_->set_fw_adjoint_sources();
+  } else {
+    // In eigenvalue mode there are no fixed adjoint sources to derive from
+    // the forward flux, but the accumulated forward flux must still be
+    // cleared so that the adjoint solve's active accumulation starts from a
+    // clean array. Otherwise any consumer of the final flux would mix
+    // forward and adjoint modes.
+#pragma omp parallel for
+    for (int64_t se = 0; se < domain_->n_source_elements(); se++) {
+      domain_->source_regions_.scalar_flux_final(se) = 0.0;
+    }
   }
 }
 
@@ -356,19 +371,17 @@ void RandomRaySimulation::prepare_local_fixed_sources_adjoint()
   }
 }
 
-void RandomRaySimulation::prepare_adjoint_simulation(bool fw_adjoint)
+void RandomRaySimulation::prepare_adjoint_simulation(bool from_forward)
 {
   reset_timers();
 
   if (mpi::master)
     header("ADJOINT FLUX SOLVE", 3);
 
-  if (fw_adjoint) {
-    // Forward simulation has already been run;
-    // Configure the domain for adjoint simulation and
-    // re-initialize OpenMC general data structures
-    FlatSourceDomain::adjoint_ = true;
-
+  if (from_forward) {
+    // The forward solve has already run. Re-initialize OpenMC's general data
+    // structures for the adjoint solve and derive the adjoint source from the
+    // forward flux.
     openmc_simulation_init();
 
     prepare_fw_fixed_sources_adjoint();
@@ -392,6 +405,11 @@ void RandomRaySimulation::simulate()
 {
   // Begin main simulation timer
   simulation::time_total.start();
+
+  // Reset per-solve accumulators, as simulate() may run more than once on the
+  // same object (e.g. forward then adjoint when generating weight windows)
+  avg_miss_rate_ = 0.0;
+  total_geometric_intersections_ = 0;
 
   // Random ray power iteration loop
   while (simulation::current_batch < settings::n_batches) {
@@ -423,14 +441,16 @@ void RandomRaySimulation::simulate()
       // Start timer for transport
       simulation::time_transport.start();
 
-// Transport sweep over all random rays for the iteration
-#pragma omp parallel for schedule(dynamic)                                     \
-  reduction(+ : total_geometric_intersections_)
+      // Transport sweep over all random rays for the iteration. NOTE: Naming a
+      // class member in a reduction clause is allowed as of OpenMP 5.1, but not
+      // every implementation supports it yet; accumulate into a local
+      uint64_t n_intersections = 0;
+#pragma omp parallel for schedule(dynamic) reduction(+ : n_intersections)
       for (int i = 0; i < settings::n_particles; i++) {
         RandomRay ray(i, domain_.get());
-        total_geometric_intersections_ +=
-          ray.transport_history_based_single_ray();
+        n_intersections += ray.transport_history_based_single_ray();
       }
+      total_geometric_intersections_ += n_intersections;
 
       simulation::time_transport.stop();
 
@@ -442,11 +462,9 @@ void RandomRaySimulation::simulate()
       domain_->normalize_scalar_flux_and_volumes(
         settings::n_particles * RandomRay::distance_active_);
 
-      // Add source to scalar flux, compute number of FSR hits
+      // Add source to scalar flux (applying any transport stabilization
+      // factors), compute number of FSR hits
       int64_t n_hits = domain_->add_source_to_scalar_flux();
-
-      // Apply transport stabilization factors
-      domain_->apply_transport_stabilization();
 
       if (settings::run_mode == RunMode::EIGENVALUE) {
         // Compute random ray k-eff
@@ -467,6 +485,11 @@ void RandomRaySimulation::simulate()
         // tallies
         domain_->random_ray_tally();
       }
+
+      // For the adaptive estimator, accumulate this batch's flux into the
+      // running sum and update (demote-only) which regions use the naive
+      // volume estimator (no-op for the other estimators).
+      domain_->demotion_step();
 
       // Set phi_old = phi_new
       domain_->flux_swap();
@@ -588,7 +611,7 @@ void RandomRaySimulation::print_results_random_ray(
       total_integrations / settings::n_batches);
 
     std::string estimator;
-    switch (domain_->volume_estimator_) {
+    switch (FlatSourceDomain::resolved_volume_estimator_) {
     case RandomRayVolumeEstimator::SIMULATION_AVERAGED:
       estimator = "Simulation Averaged";
       break;
@@ -598,12 +621,62 @@ void RandomRaySimulation::print_results_random_ray(
     case RandomRayVolumeEstimator::HYBRID:
       estimator = "Hybrid";
       break;
+    case RandomRayVolumeEstimator::ADAPTIVE:
+      estimator = "Adaptive";
+      break;
+    case RandomRayVolumeEstimator::STRICT_ADAPTIVE:
+      estimator = "Strict Adaptive";
+      break;
     default:
       fatal_error("Invalid volume estimator type");
     }
+    if (FlatSourceDomain::volume_estimator_ == RandomRayVolumeEstimator::AUTO) {
+      estimator += " (auto)";
+    }
     fmt::print(" Volume Estimator Type             = {}\n", estimator);
+    if (domain_->final_stats_valid_) {
+      double inv = 100.0 / domain_->n_source_regions();
+      // Single summary at default verbosity: every source region that
+      // received the naive volume treatment in the final batch, for any
+      // reason (the demote-only decisions made from the accumulated flux
+      // plus that batch's per-iteration demotions).
+      fmt::print(" Number of Naive Demotions         = {} SRs ({:.4f}%)\n",
+        domain_->n_final_naive_, domain_->n_final_naive_ * inv);
+      // The per-cause diagnostic breakdown is developer-facing, so it is
+      // printed at verbosity 8, above the default (7) but below the
+      // per-particle output (9).
+      // The causes are mutually exclusive and sum to the total above:
+      // "accumulated" causes are the demote-only decisions made from the
+      // running accumulated flux (from the inactive->active transition
+      // onward), "per batch" causes are re-evaluated each batch and reported
+      // for the final batch.
+      if (settings::verbosity >= 8) {
+        fmt::print("   Strong source (accumulated)     = {} SRs ({:.4f}%)\n",
+          domain_->n_final_latch_, domain_->n_final_latch_ * inv);
+        fmt::print("   Strong source (per batch)       = {} SRs ({:.4f}%)\n",
+          domain_->n_final_strong_, domain_->n_final_strong_ * inv);
+        fmt::print("   Negative flux (accumulated)     = {} SRs ({:.4f}%)\n",
+          domain_->n_final_sign_, domain_->n_final_sign_ * inv);
+        fmt::print("   Hit-starved (per batch)         = {} SRs ({:.4f}%)\n",
+          domain_->n_final_small_, domain_->n_final_small_ * inv);
+        // The strict adaptive estimator's per-batch non-negativity
+        // enforcement, reported for the final batch. These overlap the
+        // partition above rather than extending it: a rescued or floored
+        // region may or may not also carry the naive treatment.
+        if (FlatSourceDomain::resolved_volume_estimator_ ==
+            RandomRayVolumeEstimator::STRICT_ADAPTIVE) {
+          fmt::print("   Chronic negative (per batch)    = {} SRs ({:.4f}%)\n",
+            domain_->n_final_chronic_, domain_->n_final_chronic_ * inv);
+          fmt::print("   Rescued (batch volume)          = {} SRs ({:.4f}%)\n",
+            domain_->n_final_rescued_, domain_->n_final_rescued_ * inv);
+          fmt::print("   Floored (previous flux)         = {} SRs ({:.4f}%)\n",
+            domain_->n_final_floored_, domain_->n_final_floored_ * inv);
+        }
+      }
+    }
 
-    std::string adjoint_true = (FlatSourceDomain::adjoint_) ? "ON" : "OFF";
+    std::string adjoint_true =
+      (FlatSourceDomain::solve_ == RandomRaySolve::ADJOINT) ? "ON" : "OFF";
     fmt::print(" Adjoint Flux Mode                 = {}\n", adjoint_true);
 
     std::string shape;
@@ -621,6 +694,10 @@ void RandomRaySimulation::print_results_random_ray(
       fatal_error("Invalid random ray source shape");
     }
     fmt::print(" Source Shape                      = {}\n", shape);
+    if (RandomRay::source_shape_ != RandomRaySourceShape::FLAT) {
+      fmt::print(" Source Gradient Limiter           = {}\n",
+        FlatSourceDomain::source_gradient_limiter_ ? "ON" : "OFF");
+    }
     std::string sample_method;
     switch (RandomRay::sample_method_) {
     case RandomRaySampleMethod::PRNG:
@@ -675,60 +752,69 @@ void RandomRaySimulation::print_results_random_ray(
 
 void openmc_run_random_ray()
 {
-  //////////////////////////////////////////////////////////
-  // Run forward simulation
-  //////////////////////////////////////////////////////////
+  using namespace openmc;
 
-  // Check if adjoint calculation is needed, and if local adjoint source(s)
-  // are present. If an adjoint calculation is needed and no sources are
-  // specified, we will run a forward calculation first to calculate adjoint
-  // sources for global variance reduction, then perform an adjoint
-  // calculation later.
-  bool adjoint_needed = openmc::FlatSourceDomain::adjoint_;
-  bool fw_adjoint = openmc::model::adjoint_sources.empty() && adjoint_needed;
-
-  // If we're going to do an adjoint simulation with forward-weighted adjoint
-  // sources afterwards, report that this is the initial forward flux solve.
-  if (!adjoint_needed || fw_adjoint) {
-    // Configure the domain for forward simulation
-    openmc::FlatSourceDomain::adjoint_ = false;
-
-    if (adjoint_needed && openmc::mpi::master)
-      openmc::header("FORWARD FLUX SOLVE", 3);
+  // Resolve the volume estimator for this solve, leaving the configured
+  // setting untouched. "Auto" (the default) maps to a concrete estimator
+  // based on the type of simulation being performed. Solves whose results
+  // feed variance reduction (weight window generation, and any adjoint
+  // workflow, including the forward solve an adjoint source is derived
+  // from) receive the strict adaptive estimator, whose per-batch fixup of
+  // negative flux iterates benefits those workflows. All other solves
+  // receive the unbiased adaptive estimator.
+  if (FlatSourceDomain::volume_estimator_ == RandomRayVolumeEstimator::AUTO) {
+    bool positivity_needed =
+      FlatSourceDomain::adjoint_requested_ ||
+      !variance_reduction::weight_windows_generators.empty();
+    FlatSourceDomain::resolved_volume_estimator_ =
+      positivity_needed ? RandomRayVolumeEstimator::STRICT_ADAPTIVE
+                        : RandomRayVolumeEstimator::ADAPTIVE;
   } else {
-    // Configure domain for adjoint simulation (later)
-    openmc::FlatSourceDomain::adjoint_ = true;
+    FlatSourceDomain::resolved_volume_estimator_ =
+      FlatSourceDomain::volume_estimator_;
+  }
+
+  // Determine which solves to run. If adjoint results are requested and no
+  // user-defined adjoint source is present, an initial forward solve is needed
+  // to construct the adjoint source from the forward flux (FW-CADIS). If the
+  // user has defined an adjoint source, the forward solve is skipped and only
+  // the adjoint solve is run.
+  const bool run_adjoint = FlatSourceDomain::adjoint_requested_;
+  const bool have_adjoint_source = !model::adjoint_sources.empty();
+  const bool run_forward = !(run_adjoint && have_adjoint_source);
+
+  // Set the initial solve type
+  if (!run_forward) {
+    FlatSourceDomain::solve_ = RandomRaySolve::ADJOINT;
+  } else if (run_adjoint) {
+    FlatSourceDomain::solve_ = RandomRaySolve::FORWARD_FOR_ADJOINT;
+  } else {
+    FlatSourceDomain::solve_ = RandomRaySolve::FORWARD;
   }
 
   // Initialize OpenMC general data structures
   openmc_simulation_init();
 
   // Validate that inputs meet requirements for random ray mode
-  if (openmc::mpi::master)
-    openmc::validate_random_ray_inputs();
+  if (mpi::master)
+    validate_random_ray_inputs();
 
   // Initialize Random Ray Simulation Object
-  openmc::RandomRaySimulation sim;
+  RandomRaySimulation sim;
 
-  if (!adjoint_needed || fw_adjoint) {
-    // Initialize fixed sources, if present
+  // Run the forward solve
+  if (run_forward) {
+    // When an adjoint solve follows, report this as the initial forward solve
+    if (run_adjoint && mpi::master)
+      header("FORWARD FLUX SOLVE", 3);
     sim.apply_fixed_sources_and_mesh_domains();
-
-    // Execute random ray simulation
     sim.simulate();
   }
 
-  //////////////////////////////////////////////////////////
-  // Run adjoint simulation (if enabled)
-  //////////////////////////////////////////////////////////
-
-  if (!adjoint_needed) {
-    return;
+  // Run the adjoint solve
+  if (run_adjoint) {
+    FlatSourceDomain::solve_ = RandomRaySolve::ADJOINT;
+    sim.prepare_adjoint_simulation(run_forward);
+    sim.simulate();
   }
-
-  // Setup for adjoint simulation
-  sim.prepare_adjoint_simulation(fw_adjoint);
-
-  // Execute random ray simulation
-  sim.simulate();
 }

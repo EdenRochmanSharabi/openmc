@@ -35,7 +35,7 @@ constexpr array<int, 2> VERSION_VOXEL {2, 0};
 constexpr array<int, 2> VERSION_MGXS_LIBRARY {1, 0};
 constexpr array<int, 2> VERSION_PROPERTIES {1, 1};
 constexpr array<int, 2> VERSION_WEIGHT_WINDOWS {1, 0};
-constexpr array<int, 2> VERSION_COLLISION_TRACK {1, 1};
+constexpr array<int, 2> VERSION_COLLISION_TRACK {1, 2};
 
 // ============================================================================
 // ADJUSTABLE PARAMETERS
@@ -58,22 +58,26 @@ constexpr double FP_COINCIDENT {1e-12};
 constexpr double TORUS_TOL {1e-10};
 constexpr double RADIAL_MESH_TOL {1e-10};
 
+// Tolerance on the normalized normal of a general plane for treating that
+// plane as axis-aligned when computing a bounding box. Matches the value of
+// Surface._atol used by PlaneMixin.bounding_box in openmc/surface.py.
+constexpr double PLANE_ALIGNMENT_TOL {1e-12};
+
 // Maximum number of random samples per history
 constexpr int MAX_SAMPLE {100000};
 
-// Avg. number of hits per batch to be defined as a "small"
-// source region in the random ray solver
-constexpr double MIN_HITS_PER_BATCH {1.5};
-
-// The minimum flux value to be considered non-zero when computing adjoint
-// sources. Positive values below this cutoff will be treated as zero, so as to
-// prevent extremely large adjoint source terms from being generated.
-constexpr double ZERO_FLUX_CUTOFF {1e-22};
-
-// The minimum macroscopic cross section value considered non-void for the
-// random ray solver. Materials with any group with a cross section below this
-// value will be converted to pure void.
-constexpr double MINIMUM_MACRO_XS {1e-6};
+// Relative dead band applied to weight window comparisons: particles split
+// only above upper * (1 + tol) and roulette only below lower * (1 - tol).
+// Weight window arithmetic can land a particle's weight exactly back on a
+// bound value (e.g., a roulette survivor is assigned survival_ratio * lower
+// and a later split divides that back down), in which case the branch taken
+// would be decided by the last ulp of the bound. Since window data carries
+// ulp-level noise from non-associative parallel reductions in the solver that
+// generated it, transport results would otherwise be chaotically sensitive to
+// bit-level differences in the weight window file. Treating weights within
+// the band as inside the window is statistically negligible, and weight
+// window games are unbiased regardless of where the thresholds sit.
+constexpr double WEIGHT_WINDOW_REL_TOL {1e-9};
 
 // ============================================================================
 // MATH AND PHYSICAL CONSTANTS
@@ -365,9 +369,17 @@ enum class RunMode {
 
 enum class SolverType { MONTE_CARLO, RANDOM_RAY };
 
-enum class RandomRayVolumeEstimator { NAIVE, SIMULATION_AVERAGED, HYBRID };
+enum class RandomRayVolumeEstimator {
+  NAIVE,
+  SIMULATION_AVERAGED,
+  HYBRID,
+  ADAPTIVE,
+  STRICT_ADAPTIVE,
+  AUTO
+};
 enum class RandomRaySourceShape { FLAT, LINEAR, LINEAR_XY };
 enum class RandomRaySampleMethod { PRNG, HALTON, S2 };
+enum class RandomRaySolve { FORWARD, FORWARD_FOR_ADJOINT, ADJOINT };
 
 //==============================================================================
 // Geometry Constants
