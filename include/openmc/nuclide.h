@@ -84,6 +84,19 @@ public:
   double collapse_rate(int MT, double temperature, span<const double> energy,
     span<const double> flux) const;
 
+  //! \brief Calculate flux-averaged nu-fission cross section
+  //
+  //! Computes the one-group nu(E)*sigma_f(E) collapsed against a multigroup
+  //! flux, using the same integration scheme as collapse_rate but weighting
+  //! the fission cross section by the total neutron yield at each energy.
+  //!
+  //! \param[in] temperature Temperature in [K]
+  //! \param[in] energy Energy group boundaries in [eV]
+  //! \param[in] flux Flux in each energy group (not normalized per eV)
+  //! \return Flux-averaged nu-fission cross section, or 0.0 if not fissionable
+  double collapse_nu_fission_rate(double temperature,
+    span<const double> energy, span<const double> flux) const;
+
   //============================================================================
   // Data members
   std::string name_; //!< Name of nuclide, e.g. "U235"

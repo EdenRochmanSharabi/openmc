@@ -17,7 +17,7 @@ import numpy as np
 from openmc.checkvalue import check_type, check_value, check_iterable_type, PathLike
 from openmc import StatePoint
 from openmc.mgxs import GROUP_STRUCTURES
-from openmc.data import DataLibrary, REACTION_MT, Reaction
+from openmc.data import REACTION_MT
 import openmc
 from .chain import Chain, REACTIONS, _get_chain
 from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
@@ -307,82 +307,6 @@ def get_microxs_and_flux(
     return fluxes, micros
 
 
-def _collapse_nu_fission(
-    path: PathLike,
-    nuclide: str,
-    temperature: float,
-    energies: Sequence[float],
-    flux: np.ndarray
-) -> float:
-    r"""Compute a one-group fission neutron production cross section.
-
-    The fission neutron production cross section,
-    :math:`\nu(E)\sigma_f(E)`, is integrated against a flux that is assumed
-    to be constant in energy within each group, matching the treatment used
-    for other reactions in :meth:`openmc.lib.Nuclide.collapse_rate`.
-
-    Parameters
-    ----------
-    path : PathLike
-        Path to the HDF5 data file containing the nuclide.
-    nuclide : str
-        Name of the nuclide, e.g., 'U235'.
-    temperature : float
-        Temperature in [K]. The closest available temperature is used for the
-        fission cross section.
-    energies : iterable of float
-        Energy group boundaries in [eV] in ascending order.
-    flux : numpy.ndarray
-        Flux in each energy group, normalized to sum to unity.
-
-    Returns
-    -------
-    float
-        Flux-averaged fission neutron production cross section in [b]. Zero if
-        the nuclide has no fission data.
-
-    """
-    with h5py.File(path, 'r') as h5:
-        group = h5[nuclide]
-        if 'reactions/reaction_018' not in group:
-            return 0.0
-
-        # Select the available temperature closest to the requested one
-        temp_keys = list(group['energy'])
-        temps = np.array([float(t[:-1]) for t in temp_keys])
-        temp_key = temp_keys[np.argmin(np.abs(temps - temperature))]
-
-        energy_grid = {temp_key: group['energy'][temp_key][()]}
-        rx = Reaction.from_hdf5(group['reactions/reaction_018'], energy_grid)
-
-    xs = rx.xs[temp_key]
-
-    # Total nu(E) is the sum of the yields of all neutron products. If a
-    # product with emission mode 'total' is present, use it alone to avoid
-    # double counting prompt and delayed neutrons.
-    neutron_products = [p for p in rx.products if p.particle == 'neutron']
-    total_products = [p for p in neutron_products if p.emission_mode == 'total']
-    if total_products:
-        neutron_products = total_products
-    if not neutron_products:
-        return 0.0
-
-    def nu(e):
-        return sum(p.yield_(e) for p in neutron_products)
-
-    # Integrate nu(E)*sigma_f(E) against a histogram flux
-    nu_fission = 0.0
-    for g, flux_g in enumerate(flux):
-        if flux_g == 0.0:
-            continue
-        e_low, e_high = energies[g], energies[g + 1]
-        inside = xs.x[(xs.x > e_low) & (xs.x < e_high)]
-        e = np.concatenate([[e_low], inside, [e_high]])
-        nu_fission += np.trapezoid(nu(e) * xs(e), e) * flux_g / (e_high - e_low)
-
-    return nu_fission
-
-
 class MicroXS:
     """Microscopic cross section data for use in transport-independent depletion.
 
@@ -505,12 +429,10 @@ class MicroXS:
             nuclides = [nuc.name for nuc in nuclides]
 
         # Get reaction MT values. If no reactions specified, default to the
-        # reactions available in the chain file. The 'nu-fission' reaction is
-        # handled separately since it does not correspond to a single MT value.
+        # reactions available in the chain file.
         if reactions is None:
             reactions = chain.reactions
-        mts = [REACTION_MT[name] if name != 'nu-fission' else None
-               for name in reactions]
+        mts = [REACTION_MT.get(name) for name in reactions]
 
         # Create 3D array for microscopic cross sections
         microxs_arr = np.zeros((len(nuclides), len(mts), 1))
@@ -523,24 +445,19 @@ class MicroXS:
         # Normalize multigroup flux
         multigroup_flux /= flux_sum
 
-        # If nu-fission was requested, get paths to pointwise data files
-        if 'nu-fission' in reactions:
-            data_library = DataLibrary.from_xml(cross_sections)
-
         # Compute microscopic cross sections within a temporary session
         with openmc.lib.TemporarySession(**init_kwargs):
-            # For each nuclide and reaction, compute the flux-averaged xs
             for nuc_index, nuc in enumerate(nuclides):
                 if nuc not in nuclides_with_data:
                     continue
                 lib_nuc = openmc.lib.load_nuclide(nuc)
-                for mt_index, mt in enumerate(mts):
-                    if mt is None:
-                        path = data_library.get_by_material(nuc)['path']
+                for mt_index, (rxn_name, mt) in enumerate(
+                        zip(reactions, mts)):
+                    if rxn_name == 'nu-fission':
                         microxs_arr[nuc_index, mt_index, 0] = \
-                            _collapse_nu_fission(path, nuc, temperature,
-                                                 energies, multigroup_flux)
-                    else:
+                            lib_nuc.collapse_nu_fission_rate(
+                                temperature, energies, multigroup_flux)
+                    elif mt is not None:
                         microxs_arr[nuc_index, mt_index, 0] = \
                             lib_nuc.collapse_rate(
                                 mt, temperature, energies, multigroup_flux)

@@ -8,7 +8,6 @@ transport solver by using user-provided multigroup fluxes and cross sections.
 from __future__ import annotations
 from collections.abc import Iterable
 import copy
-import re
 
 import numpy as np
 from uncertainties import ufloat
@@ -17,23 +16,12 @@ import openmc
 from openmc.checkvalue import check_type
 from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
+from .chain import REACTIONS
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
 from .microxs import MicroXS
 from .results import Results
 from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper
-
-# Regular expression matching reactions that emit one or more neutrons, e.g.,
-# (n,2n) or (n,np), with the number of emitted neutrons captured
-_XN_REACTION = re.compile(r'\(n,(\d*)n')
-
-
-def _neutrons_emitted(reaction: str) -> int:
-    """Number of neutrons in the exit channel of a transmutation reaction."""
-    match = _XN_REACTION.match(reaction)
-    if match is None:
-        return 0
-    return int(match.group(1)) if match.group(1) else 1
 
 
 class IndependentOperator(OpenMCOperator):
@@ -67,15 +55,15 @@ class IndependentOperator(OpenMCOperator):
         Path to the depletion chain XML file or instance of openmc.deplete.Chain.
         Defaults to ``openmc.config['chain_file']``.
     keff : 2-tuple of float, optional
-       keff eigenvalue and uncertainty from transport calculation.
-    calculate_kinf : bool, optional
-        If True, the infinite multiplication factor is estimated from the
-        material compositions and one-group cross sections at each depletion
-        step and reported as the eigenvalue in the depletion results. Requires
-        that each :class:`~openmc.deplete.MicroXS` instance contains 'fission'
-        and 'nu-fission' cross sections. Mutually exclusive with ``keff``.
+       keff eigenvalue and uncertainty from transport calculation. When not
+       provided and every :class:`~openmc.deplete.MicroXS` instance contains
+       both 'fission' and 'nu-fission' cross sections, the infinite
+       multiplication factor is estimated automatically from the material
+       compositions and one-group cross sections at each depletion step.
 
-        .. versionadded:: 0.15.4
+       .. versionchanged:: 0.15.4
+           k-infinity is now estimated automatically when ``keff`` is not
+           given and the required cross sections are present.
     prev_results : Results, optional
         Results from a previous depletion calculation.
     normalization_mode : {"fission-q", "source-rate"}
@@ -137,8 +125,7 @@ class IndependentOperator(OpenMCOperator):
                  fission_q=None,
                  prev_results=None,
                  reduce_chain_level=None,
-                 fission_yield_opts=None,
-                 calculate_kinf=False):
+                 fission_yield_opts=None):
         # Validate micro-xs parameters
         check_type('materials', materials, Iterable, openmc.Material)
         check_type('micros', micros, Iterable, MicroXS)
@@ -156,19 +143,13 @@ class IndependentOperator(OpenMCOperator):
 
         self._keff = keff
 
-        check_type('calculate_kinf', calculate_kinf, bool)
-        if calculate_kinf:
-            if keff is not None:
-                raise ValueError("The 'keff' and 'calculate_kinf' arguments "
-                                 "are mutually exclusive.")
-            for micro in micros:
-                missing = {'fission', 'nu-fission'} - set(micro.reactions)
-                if missing:
-                    raise ValueError(
-                        "Estimating k-infinity requires 'fission' and "
-                        "'nu-fission' cross sections in each MicroXS "
-                        f"instance (missing {sorted(missing)}).")
-        self._calculate_kinf = calculate_kinf
+        # Auto-detect k-infinity capability: estimate kinf when keff is not
+        # provided and every MicroXS contains fission + nu-fission data.
+        self._calculate_kinf = (
+            keff is None
+            and all('fission' in m.reactions and 'nu-fission' in m.reactions
+                    for m in micros)
+        )
 
         if fission_yield_opts is None:
             fission_yield_opts = {}
@@ -201,8 +182,7 @@ class IndependentOperator(OpenMCOperator):
                       fission_q=None,
                       prev_results=None,
                       reduce_chain_level=None,
-                      fission_yield_opts=None,
-                      calculate_kinf=False):
+                      fission_yield_opts=None):
         """
         Alternate constructor from a dictionary of nuclide concentrations
 
@@ -224,13 +204,6 @@ class IndependentOperator(OpenMCOperator):
         keff : 2-tuple of float, optional
            keff eigenvalue and uncertainty from transport calculation.
            Default is None.
-        calculate_kinf : bool, optional
-            If True, the infinite multiplication factor is estimated from the
-            material compositions and one-group cross sections at each
-            depletion step. Requires that ``micro_xs`` contains 'fission' and
-            'nu-fission' cross sections. Mutually exclusive with ``keff``.
-
-            .. versionadded:: 0.15.4
         normalization_mode : {"fission-q", "source-rate"}
             Indicate how reaction rates should be calculated.
             ``"fission-q"`` uses the fission Q values from the depletion
@@ -266,8 +239,7 @@ class IndependentOperator(OpenMCOperator):
                    fission_q=fission_q,
                    prev_results=prev_results,
                    reduce_chain_level=reduce_chain_level,
-                   fission_yield_opts=fission_yield_opts,
-                   calculate_kinf=calculate_kinf)
+                   fission_yield_opts=fission_yield_opts)
 
     @staticmethod
     def _consolidate_nuclides_to_material(nuclides, nuc_units, volume):
@@ -508,8 +480,13 @@ class IndependentOperator(OpenMCOperator):
                     rate = atoms * (micro_xs[nuc, rxn] * flux).sum()
                     if rxn == 'nu-fission':
                         production += rate
-                    elif rxn != 'damage-energy':
-                        loss += (1 - _neutrons_emitted(rxn)) * rate
+                    elif rxn == 'damage-energy':
+                        pass
+                    elif rxn in REACTIONS:
+                        n_out = REACTIONS[rxn].neutrons_out
+                        loss += (1 - n_out) * rate
+                    else:
+                        loss += rate
 
         # Sum contributions over all MPI processes
         production = comm.allreduce(production)

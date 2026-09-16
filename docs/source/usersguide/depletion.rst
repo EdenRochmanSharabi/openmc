@@ -270,13 +270,12 @@ transport-depletion calculation and follow the same steps from there.
    the depletion chain with at least one reaction, that reaction will not be
    simulated.
 
-If the microscopic cross section data includes 'fission' and 'nu-fission'
-cross sections, :class:`~openmc.deplete.IndependentOperator` can also estimate
-the infinite multiplication factor at each depletion step by passing
-``calculate_kinf=True``::
+When the microscopic cross section data includes both 'fission' and
+'nu-fission' cross sections and no explicit ``keff`` value is provided,
+:class:`~openmc.deplete.IndependentOperator` automatically estimates the
+infinite multiplication factor at each depletion step::
 
-    op = openmc.deplete.IndependentOperator(materials, fluxes, micros,
-                                            calculate_kinf=True)
+    op = openmc.deplete.IndependentOperator(materials, fluxes, micros)
 
 The estimate is computed as the ratio of the neutron production rate to the
 neutron loss rate based on the one-group reaction rates and is reported as the

@@ -9,7 +9,7 @@ import pytest
 
 from openmc import Material
 from openmc.deplete import IndependentOperator, MicroXS, Chain
-from openmc.deplete.independent_operator import _neutrons_emitted
+from openmc.deplete.chain import REACTIONS
 
 CHAIN_PATH = Path(__file__).parents[1] / "chain_simple.xml"
 ONE_GROUP_XS = Path(__file__).parents[1] / "micro_xs_simple.csv"
@@ -67,20 +67,19 @@ def _uranium_material():
     return fuel
 
 
-def test_neutrons_emitted():
-    assert _neutrons_emitted('fission') == 0
-    assert _neutrons_emitted('(n,gamma)') == 0
-    assert _neutrons_emitted('(n,p)') == 0
-    assert _neutrons_emitted('(n,a)') == 0
-    assert _neutrons_emitted('(n,3He)') == 0
-    assert _neutrons_emitted('(n,2a)') == 0
-    assert _neutrons_emitted('(n,np)') == 1
-    assert _neutrons_emitted('(n,nd2a)') == 1
-    assert _neutrons_emitted('(n,2n)') == 2
-    assert _neutrons_emitted('(n,2nd)') == 2
-    assert _neutrons_emitted('(n,3n)') == 3
-    assert _neutrons_emitted('(n,3np)') == 3
-    assert _neutrons_emitted('(n,4n)') == 4
+def test_neutrons_out_in_reactions():
+    assert REACTIONS['(n,gamma)'].neutrons_out == 0
+    assert REACTIONS['(n,p)'].neutrons_out == 0
+    assert REACTIONS['(n,a)'].neutrons_out == 0
+    assert REACTIONS['(n,3He)'].neutrons_out == 0
+    assert REACTIONS['(n,2a)'].neutrons_out == 0
+    assert REACTIONS['(n,np)'].neutrons_out == 1
+    assert REACTIONS['(n,nd2a)'].neutrons_out == 1
+    assert REACTIONS['(n,2n)'].neutrons_out == 2
+    assert REACTIONS['(n,2nd)'].neutrons_out == 2
+    assert REACTIONS['(n,3n)'].neutrons_out == 3
+    assert REACTIONS['(n,3np)'].neutrons_out == 3
+    assert REACTIONS['(n,4n)'].neutrons_out == 4
 
 
 def test_calculate_kinf():
@@ -94,9 +93,10 @@ def test_calculate_kinf():
     ])
     micro_xs = MicroXS(data, nuclides, reactions)
 
+    # With fission + nu-fission present and no keff, kinf is auto-detected
     op = IndependentOperator(
         [_uranium_material()], [np.array([1.0])], [micro_xs], CHAIN_PATH,
-        normalization_mode='source-rate', calculate_kinf=True)
+        normalization_mode='source-rate')
     vec = op.initial_condition()
 
     # Production is nu-fission; loss is fission + (n,gamma) - (n,2n), since
@@ -128,7 +128,7 @@ def test_calculate_kinf_multigroup():
 
     op = IndependentOperator(
         [fuel], [flux], [micro_xs], CHAIN_PATH,
-        normalization_mode='source-rate', calculate_kinf=True)
+        normalization_mode='source-rate')
     vec = op.initial_condition()
 
     production = 25.0*0.75 + 120.0*0.25
@@ -137,16 +137,18 @@ def test_calculate_kinf_multigroup():
     assert result.k.n == pytest.approx(production / loss)
 
 
-def test_calculate_kinf_errors():
-    # MicroXS without nu-fission data cannot be used to estimate k-infinity
+def test_kinf_not_computed_without_nu_fission():
+    # When MicroXS lacks nu-fission, kinf is not computed and keff stays None
     micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
-    with pytest.raises(ValueError, match="nu-fission"):
-        IndependentOperator([_uranium_material()], [1.0], [micro_xs],
-                            CHAIN_PATH, calculate_kinf=True)
+    op = IndependentOperator([_uranium_material()], [1.0], [micro_xs],
+                              CHAIN_PATH)
+    assert not op._calculate_kinf
 
-    # keff and calculate_kinf are mutually exclusive
+
+def test_kinf_not_computed_when_keff_given():
+    # When keff is explicitly given, kinf auto-detection is disabled
     data = np.zeros((1, 2, 1))
     micro_xs = MicroXS(data, ['U235'], ['fission', 'nu-fission'])
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        IndependentOperator([_uranium_material()], [1.0], [micro_xs],
-                            CHAIN_PATH, keff=(1.0, 0.0), calculate_kinf=True)
+    op = IndependentOperator([_uranium_material()], [1.0], [micro_xs],
+                              CHAIN_PATH, keff=(1.0, 0.0))
+    assert not op._calculate_kinf

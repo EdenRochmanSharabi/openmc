@@ -1072,6 +1072,95 @@ double Nuclide::collapse_rate(int MT, double temperature,
   }
 }
 
+double Nuclide::collapse_nu_fission_rate(double temperature,
+  span<const double> energy, span<const double> flux) const
+{
+  if (!fissionable_)
+    return 0.0;
+
+  assert(energy.size() > 0);
+  assert(energy.size() == flux.size() + 1);
+
+  int i_rx = reaction_index_[18];
+  if (i_rx < 0)
+    return 0.0;
+  const auto& rx = reactions_[i_rx];
+
+  // Determine temperature index
+  int64_t i_temp;
+  double f;
+  std::tie(i_temp, f) = this->find_temperature(temperature);
+
+  // Helper to integrate nu(E)*sigma_f(E)*phi(E) at a given temperature
+  auto compute = [&](int64_t t_idx) -> double {
+    const auto& xs = rx->xs_[t_idx].value;
+    const auto& grid = grid_[t_idx].energy;
+    int i_low = lower_bound_index(grid.cbegin(), grid.cend(), energy.front());
+
+    int j_start = 0;
+    int i_threshold = rx->xs_[t_idx].threshold;
+    if (i_low < i_threshold) {
+      i_low = i_threshold;
+      while (energy[j_start + 1] < grid[i_low]) {
+        ++j_start;
+        if (static_cast<size_t>(j_start + 1) == energy.size())
+          return 0.0;
+      }
+    }
+
+    double rate_sum = 0.0;
+
+    for (size_t j = j_start; j < flux.size(); ++j) {
+      double E_group_low = energy[j];
+      double E_group_high = energy[j + 1];
+      double flux_per_eV = flux[j] / (E_group_high - E_group_low);
+
+      int i_high = i_low;
+      while (grid[i_high + 1] < E_group_high &&
+             static_cast<size_t>(i_high + 1) < grid.size() - 1)
+        ++i_high;
+
+      for (; i_low <= i_high; ++i_low) {
+        double E_l = grid[i_low];
+        double E_r = grid[i_low + 1];
+        if (E_l == E_r)
+          continue;
+
+        double xs_l = xs[i_low - i_threshold];
+        double xs_r = xs[i_low + 1 - i_threshold];
+
+        double E_low = std::max(E_group_low, E_l);
+        double E_high = std::min(E_group_high, E_r);
+
+        double m = (xs_r - xs_l) / (E_r - E_l);
+        double sig_low = xs_l + m * (E_low - E_l);
+        double sig_high = xs_l + m * (E_high - E_l);
+
+        double nu_low = this->nu(E_low, EmissionMode::total);
+        double nu_high = this->nu(E_high, EmissionMode::total);
+
+        double nuxs_avg = 0.5 * (nu_low * sig_low + nu_high * sig_high);
+
+        double dE = (E_high - E_low);
+        rate_sum += flux_per_eV * nuxs_avg * dE;
+      }
+
+      i_low = i_high;
+      if (static_cast<size_t>(i_low + 1) == grid.size())
+        break;
+    }
+
+    return rate_sum;
+  };
+
+  double rr_low = compute(i_temp);
+  if (f > 0.0) {
+    double rr_high = compute(i_temp + 1);
+    return rr_low + f * (rr_high - rr_low);
+  }
+  return rr_low;
+}
+
 //==============================================================================
 // Non-member functions
 //==============================================================================
@@ -1208,6 +1297,25 @@ extern "C" int openmc_nuclide_collapse_rate(int index, int MT,
   try {
     *xs = data::nuclides[index]->collapse_rate(
       MT, temperature, {energy, energy + n + 1}, {flux, flux + n});
+  } catch (const std::out_of_range& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_OUT_OF_BOUNDS;
+  }
+  return 0;
+}
+
+extern "C" int openmc_nuclide_collapse_nu_fission_rate(int index,
+  double temperature, const double* energy, const double* flux, int n,
+  double* xs)
+{
+  if (index < 0 || index >= data::nuclides.size()) {
+    set_errmsg("Index in nuclides vector is out of bounds.");
+    return OPENMC_E_OUT_OF_BOUNDS;
+  }
+
+  try {
+    *xs = data::nuclides[index]->collapse_nu_fission_rate(
+      temperature, {energy, energy + n + 1}, {flux, flux + n});
   } catch (const std::out_of_range& e) {
     set_errmsg(e.what());
     return OPENMC_E_OUT_OF_BOUNDS;
