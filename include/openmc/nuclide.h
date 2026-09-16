@@ -94,8 +94,8 @@ public:
   //! \param[in] energy Energy group boundaries in [eV]
   //! \param[in] flux Flux in each energy group (not normalized per eV)
   //! \return Flux-averaged nu-fission cross section, or 0.0 if not fissionable
-  double collapse_nu_fission_rate(double temperature,
-    span<const double> energy, span<const double> flux) const;
+  double collapse_nu_fission_rate(double temperature, span<const double> energy,
+    span<const double> flux) const;
 
   //! Return a ParticleType object representing this nuclide
   ParticleType particle_type() const { return {Z_, A_, metastable_}; }

@@ -437,7 +437,7 @@ class MicroXS:
             needed to estimate k-infinity with
             :class:`~openmc.deplete.IndependentOperator`.
 
-            .. versionchanged:: 0.15.4
+            .. versionchanged:: 0.16.1
                 Added support for 'nu-fission'.
         **init_kwargs : dict
             Keyword arguments passed to :func:`openmc.lib.init`
@@ -474,7 +474,10 @@ class MicroXS:
         # reactions available in the chain file.
         if reactions is None:
             reactions = chain.reactions
-        mts = [REACTION_MT.get(name) for name in reactions]
+        # 'nu-fission' has no MT of its own and is collapsed separately
+        # below; every other reaction name must map to an MT
+        mts = [None if name == 'nu-fission' else REACTION_MT[name]
+               for name in reactions]
 
         # Create 3D array for microscopic cross sections
         microxs_arr = np.zeros((len(nuclides), len(mts), 1))

@@ -8,6 +8,7 @@ transport solver by using user-provided multigroup fluxes and cross sections.
 from __future__ import annotations
 from collections.abc import Iterable
 import copy
+from warnings import warn
 
 import numpy as np
 from uncertainties import ufloat
@@ -61,7 +62,7 @@ class IndependentOperator(OpenMCOperator):
        multiplication factor is estimated automatically from the material
        compositions and one-group cross sections at each depletion step.
 
-       .. versionchanged:: 0.15.4
+       .. versionchanged:: 0.16.1
            k-infinity is now estimated automatically when ``keff`` is not
            given and the required cross sections are present.
     prev_results : Results, optional
@@ -147,6 +148,7 @@ class IndependentOperator(OpenMCOperator):
         # provided and every MicroXS contains fission + nu-fission data.
         self._calculate_kinf = (
             keff is None
+            and len(micros) > 0
             and all('fission' in m.reactions and 'nu-fission' in m.reactions
                     for m in micros)
         )
@@ -497,6 +499,9 @@ class IndependentOperator(OpenMCOperator):
         loss = comm.allreduce(loss)
 
         if loss <= 0.0:
+            warn('Unable to estimate k-infinity because the total neutron '
+                 'loss rate is zero. Check that the supplied MicroXS data '
+                 'contains absorption reactions for the nuclides present.')
             return ufloat(0.0, 0.0)
         return ufloat(production / loss, 0.0)
 

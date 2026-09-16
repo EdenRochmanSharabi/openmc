@@ -1072,8 +1072,8 @@ double Nuclide::collapse_rate(int MT, double temperature,
   }
 }
 
-double Nuclide::collapse_nu_fission_rate(double temperature,
-  span<const double> energy, span<const double> flux) const
+double Nuclide::collapse_nu_fission_rate(
+  double temperature, span<const double> energy, span<const double> flux) const
 {
   if (!fissionable_)
     return 0.0;
@@ -1081,7 +1081,7 @@ double Nuclide::collapse_nu_fission_rate(double temperature,
   assert(energy.size() > 0);
   assert(energy.size() == flux.size() + 1);
 
-  int i_rx = reaction_index_[18];
+  int i_rx = reaction_index_[N_FISSION];
   if (i_rx < 0)
     return 0.0;
   const auto& rx = reactions_[i_rx];

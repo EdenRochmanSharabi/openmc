@@ -119,7 +119,7 @@ class Nuclide(_FortranObject):
     def collapse_nu_fission_rate(self, temperature, energy, flux):
         r"""Calculate flux-averaged :math:`\nu\sigma_f` cross section
 
-        .. versionadded:: 0.15.4
+        .. versionadded:: 0.16.1
 
         Parameters
         ----------
