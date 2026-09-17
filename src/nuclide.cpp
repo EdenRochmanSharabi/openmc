@@ -1081,36 +1081,25 @@ double Nuclide::collapse_nu_fission_rate(
   assert(energy.size() > 0);
   assert(energy.size() == flux.size() + 1);
 
-  int i_rx = reaction_index_[N_FISSION];
-  if (i_rx < 0)
-    return 0.0;
-  const auto& rx = reactions_[i_rx];
-
   // Determine temperature index
   int64_t i_temp;
   double f;
   std::tie(i_temp, f) = this->find_temperature(temperature);
 
-  // Helper to integrate nu(E)*sigma_f(E)*phi(E) at a given temperature
+  // Helper to integrate nu(E)*sigma_f(E)*phi(E) at a given temperature. The
+  // nu-fission cross section is pre-tabulated on the nuclide's union energy
+  // grid (see Nuclide::init_grid), so we collapse the XS_NU_FISSION column
+  // directly with the same trapezoidal scheme as Reaction::collapse_rate.
+  // Unlike a Reaction's cross section array, the nuclide grid has no
+  // threshold offset, and XS_NU_FISSION already sums over all partial
+  // fission reactions.
   auto compute = [&](int64_t t_idx) -> double {
-    const auto& xs = rx->xs_[t_idx].value;
     const auto& grid = grid_[t_idx].energy;
     int i_low = lower_bound_index(grid.cbegin(), grid.cend(), energy.front());
 
-    int j_start = 0;
-    int i_threshold = rx->xs_[t_idx].threshold;
-    if (i_low < i_threshold) {
-      i_low = i_threshold;
-      while (energy[j_start + 1] < grid[i_low]) {
-        ++j_start;
-        if (static_cast<size_t>(j_start + 1) == energy.size())
-          return 0.0;
-      }
-    }
-
     double rate_sum = 0.0;
 
-    for (size_t j = j_start; j < flux.size(); ++j) {
+    for (size_t j = 0; j < flux.size(); ++j) {
       double E_group_low = energy[j];
       double E_group_high = energy[j + 1];
       double flux_per_eV = flux[j] / (E_group_high - E_group_low);
@@ -1126,23 +1115,18 @@ double Nuclide::collapse_nu_fission_rate(
         if (E_l == E_r)
           continue;
 
-        double xs_l = xs[i_low - i_threshold];
-        double xs_r = xs[i_low + 1 - i_threshold];
+        double nuxs_l = xs_[t_idx](i_low, XS_NU_FISSION);
+        double nuxs_r = xs_[t_idx](i_low + 1, XS_NU_FISSION);
 
         double E_low = std::max(E_group_low, E_l);
         double E_high = std::min(E_group_high, E_r);
 
-        double m = (xs_r - xs_l) / (E_r - E_l);
-        double sig_low = xs_l + m * (E_low - E_l);
-        double sig_high = xs_l + m * (E_high - E_l);
+        double m = (nuxs_r - nuxs_l) / (E_r - E_l);
+        double sig_low = nuxs_l + m * (E_low - E_l);
+        double sig_high = nuxs_l + m * (E_high - E_l);
+        double nuxs_avg = 0.5 * (sig_low + sig_high);
 
-        double nu_low = this->nu(E_low, EmissionMode::total);
-        double nu_high = this->nu(E_high, EmissionMode::total);
-
-        double nuxs_avg = 0.5 * (nu_low * sig_low + nu_high * sig_high);
-
-        double dE = (E_high - E_low);
-        rate_sum += flux_per_eV * nuxs_avg * dE;
+        rate_sum += flux_per_eV * nuxs_avg * (E_high - E_low);
       }
 
       i_low = i_high;

@@ -58,9 +58,11 @@ class IndependentOperator(OpenMCOperator):
     keff : 2-tuple of float, optional
        keff eigenvalue and uncertainty from transport calculation. When not
        provided and every :class:`~openmc.deplete.MicroXS` instance contains
-       both 'fission' and 'nu-fission' cross sections, the infinite
-       multiplication factor is estimated automatically from the material
-       compositions and one-group cross sections at each depletion step.
+       both 'fission' and 'nu-fission' cross sections as well as all
+       transmutation reactions defined by the depletion chain, the infinite
+       multiplication factor of the depletable materials is estimated
+       automatically from the material compositions and multigroup cross
+       sections at each depletion step.
 
        .. versionchanged:: 0.16.1
            k-infinity is now estimated automatically when ``keff`` is not
@@ -172,6 +174,25 @@ class IndependentOperator(OpenMCOperator):
             fission_q=fission_q,
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
+
+        # The k-infinity estimate divides the neutron production rate by the
+        # neutron loss rate, so the loss term must include every absorption
+        # channel that the depletion chain will use. If a MicroXS is missing
+        # some of the chain's transmutation reactions (e.g., only 'fission'
+        # and 'nu-fission' were tallied), the ratio would silently degenerate
+        # toward nu-bar rather than k-infinity. Note that self.chain only
+        # exists after the super().__init__() call above (which also applies
+        # any chain reduction), so this check must come here.
+        if self._calculate_kinf:
+            chain_rxns = set(self.chain.reactions)
+            for m in micros:
+                if not chain_rxns <= set(m.reactions):
+                    missing = chain_rxns - set(m.reactions)
+                    warn(f'Disabling k-infinity estimate: MicroXS is missing '
+                         f'chain reactions {missing}. The estimate requires '
+                         f'all absorption channels to be present.')
+                    self._calculate_kinf = False
+                    break
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,
@@ -446,23 +467,60 @@ class IndependentOperator(OpenMCOperator):
         return copy.deepcopy(op_result)
 
     def _estimate_k_inf(self):
-        r"""Estimate the infinite multiplication factor.
+        r"""Estimate the infinite multiplication factor of the depletable
+        materials.
 
         The estimate is computed as the ratio of the neutron production rate
-        to the neutron loss rate:
+        to the neutron loss rate summed over the *depletable materials only*:
 
         .. math::
-            k_\infty = \frac{\sum_i N_i (\nu\sigma_f)_i}
-                            {\sum_i N_i \sum_j (1 - x_j) \sigma_{i,j}}
+            k_\infty = \frac{\displaystyle\sum_m \frac{1}{V_m} \sum_i N_{m,i}
+                             \sum_g (\nu\sigma_f)_{m,i,g}\, \phi_{m,g}}
+                            {\displaystyle\sum_m \frac{1}{V_m} \sum_i N_{m,i}
+                             \sum_j (1 - x_j) \sum_g \sigma_{m,i,j,g}\,
+                             \phi_{m,g}}
 
-        where :math:`N_i` is the number of atoms of nuclide :math:`i`,
-        :math:`(\nu\sigma_f)_i` is its one-group fission neutron production
-        cross section, :math:`\sigma_{i,j}` is the one-group cross section of
-        transmutation reaction :math:`j`, and :math:`x_j` is the number of
-        neutrons emitted by reaction :math:`j`. This is consistent with the
-        definition of the multiplication factor used elsewhere in OpenMC:
-        neutrons produced in (n,xn) reactions are not counted as production;
-        instead, each (n,xn) reaction reduces the loss term by :math:`x - 1`.
+        where the index :math:`m` runs over the depletable materials,
+        :math:`i` over the nuclides with cross-section data, :math:`j` over
+        the transmutation reactions, and :math:`g` over the energy groups.
+        :math:`N_{m,i}` is the number of atoms of nuclide :math:`i` in
+        material :math:`m`, :math:`V_m` is the material volume,
+        :math:`\phi_{m,g}` is the volume-integrated multigroup flux from the
+        transport run, :math:`(\nu\sigma_f)_{m,i,g}` is the fission neutron
+        production cross section, :math:`\sigma_{m,i,j,g}` is the cross
+        section of transmutation reaction :math:`j`, and :math:`x_j` is the
+        number of neutrons emitted by reaction :math:`j`.
+
+        **This is not k-eff.** The balance above contains no leakage term, so
+        it relates to the effective multiplication factor as
+        :math:`k_\infty = k_\text{eff} / (1 - L)` where :math:`L` is the
+        leakage fraction. Moreover, only depletable materials contribute to
+        the loss term: for models that also contain non-depletable materials
+        (moderator, cladding, reflector, ...), absorption in those materials
+        is not accounted for, and the estimate will be *higher* than the true
+        k-infinity of the full system. In other words, the estimate assumes
+        that all relevant absorption happens in the depletable materials.
+
+        The treatment of (n,xn) reactions follows from writing the
+        multiplication factor as
+
+        .. math::
+            k_\text{eff} = \frac{P}{A + L - X}
+
+        where :math:`P` is the fission neutron production rate, :math:`A` the
+        absorption rate, :math:`L` the leakage rate, and :math:`X` the net
+        neutron production rate from (n,xn) reactions. The denominator uses
+        "reduced absorption" :math:`A - X`, which is exactly the convention
+        used by OpenMC's k-eff estimators: neutrons produced in (n,xn)
+        reactions are not counted as production; instead each (n,xn) reaction
+        with :math:`x` neutrons out contributes :math:`(1 - x)` times its
+        rate to the loss term, giving :math:`A - X` in a single pass over the
+        reactions.
+
+        Assumptions: the multigroup fluxes are those obtained from the
+        transport run (and are not recomputed as the compositions change),
+        non-depletable materials do not deplete, and any background
+        absorption outside the depletable materials is constant and ignored.
 
         Returns
         -------
@@ -476,6 +534,11 @@ class IndependentOperator(OpenMCOperator):
             i_mat = self._mat_index_map[mat]
             flux = self.fluxes[i_mat]
             micro_xs = self.cross_sections[i_mat]
+
+            # Convert total atoms and volume-integrated flux to rates per
+            # unit volume, consistent with _calculate_reaction_rates
+            volume_b_cm = 1e24 * self.number.get_mat_volume(mat)
+
             for nuc in micro_xs.nuclides:
                 if nuc not in self.number.index_nuc:
                     continue
@@ -483,7 +546,8 @@ class IndependentOperator(OpenMCOperator):
                 if atoms <= 0.0:
                     continue
                 for rxn in micro_xs.reactions:
-                    rate = atoms * (micro_xs[nuc, rxn] * flux).sum()
+                    rate = (atoms * (micro_xs[nuc, rxn] * flux).sum()
+                            / volume_b_cm)
                     if rxn == 'nu-fission':
                         production += rate
                     elif rxn == 'damage-energy':

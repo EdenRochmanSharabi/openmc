@@ -137,6 +137,62 @@ def test_calculate_kinf_multigroup():
     assert result.k.n == pytest.approx(production / loss)
 
 
+def test_calculate_kinf_two_materials():
+    # Two depletable materials with different volumes. Material 1 contains
+    # only U235 (the fissile inventory) and material 2 contains only U238
+    # (a pure absorber here). With proper per-volume normalization the
+    # estimate depends on the atom densities, not on the material volumes.
+    nuclides = ['U235', 'U238']
+    reactions = ['fission', 'nu-fission', '(n,gamma)']
+    data = np.array([
+        [[50.0], [120.0], [10.0]],
+        [[0.0], [0.0], [20.0]],
+    ])
+    micro_xs = MicroXS(data, nuclides, reactions)
+
+    def build_op(vol1, vol2):
+        mat1 = Material(name="fissile")
+        mat1.add_nuclide("U235", 0.05)
+        mat1.set_density("sum")
+        mat1.depletable = True
+        mat1.volume = vol1
+
+        mat2 = Material(name="absorber")
+        mat2.add_nuclide("U238", 0.05)
+        mat2.set_density("sum")
+        mat2.depletable = True
+        mat2.volume = vol2
+
+        return IndependentOperator(
+            [mat1, mat2], [np.array([1.0]), np.array([1.0])],
+            [micro_xs, micro_xs], CHAIN_PATH,
+            normalization_mode='source-rate')
+
+    # Both materials have the same atom density (0.05 atom/b-cm), so the
+    # volume-normalized rates weight both materials equally:
+    # production = 120, loss = (50 + 10) + 20 = 80
+    expected = 120.0 / 80.0
+
+    for vol1, vol2 in [(1.0, 4.0), (2.0, 2.0), (3.0, 0.5)]:
+        op = build_op(vol1, vol2)
+        vec = op.initial_condition()
+        result = op(vec, 1.0)
+        assert result.k.n == pytest.approx(expected), (vol1, vol2)
+
+
+def test_kinf_disabled_when_reactions_missing():
+    # A MicroXS narrowed to only fission channels lacks the chain's
+    # absorption reactions (e.g. (n,gamma)); the resulting ratio would just
+    # be nu-bar, so the estimate must be disabled with a warning.
+    data = np.array([[[50.0], [120.0]]])
+    micro_xs = MicroXS(data, ['U235'], ['fission', 'nu-fission'])
+    with pytest.warns(UserWarning, match='Disabling k-infinity'):
+        op = IndependentOperator(
+            [_uranium_material()], [np.array([1.0])], [micro_xs], CHAIN_PATH,
+            normalization_mode='source-rate')
+    assert not op._calculate_kinf
+
+
 def test_kinf_not_computed_without_nu_fission():
     # When MicroXS lacks nu-fission, kinf is not computed and keff stays None
     micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
