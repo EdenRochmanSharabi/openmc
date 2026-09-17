@@ -1095,7 +1095,13 @@ double Nuclide::collapse_nu_fission_rate(
   // fission reactions.
   auto compute = [&](int64_t t_idx) -> double {
     const auto& grid = grid_[t_idx].energy;
-    int i_low = lower_bound_index(grid.cbegin(), grid.cend(), energy.front());
+    // lower_bound_index returns -1 when the first group boundary lies below
+    // the nuclide's energy grid, which is the usual case for a group
+    // structure starting at 0 eV. Reaction::collapse_rate happens to mask
+    // this with its threshold adjustment; the nuclide grid has no threshold,
+    // so clamp explicitly rather than indexing grid[-1] below.
+    int i_low = std::max(0, static_cast<int>(lower_bound_index(
+                              grid.cbegin(), grid.cend(), energy.front())));
 
     double rate_sum = 0.0;
 

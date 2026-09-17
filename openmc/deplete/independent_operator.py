@@ -519,8 +519,10 @@ class IndependentOperator(OpenMCOperator):
 
         Assumptions: the multigroup fluxes are those obtained from the
         transport run (and are not recomputed as the compositions change),
-        non-depletable materials do not deplete, and any background
-        absorption outside the depletable materials is constant and ignored.
+        non-depletable materials do not deplete, and absorption outside the
+        depletable materials is ignored entirely. The bias introduced by that
+        last assumption stays roughly constant over the depletion only to the
+        extent that the background absorption itself does.
 
         Returns
         -------

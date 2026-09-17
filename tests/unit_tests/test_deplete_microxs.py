@@ -143,6 +143,61 @@ def test_from_multigroup_flux_nu_fission():
     assert nu_bar_fast > nu_bar
 
 
+def test_nu_fission_collapse_below_energy_grid():
+    """Group structure starting below the nuclide's energy grid.
+
+    Regression test: when the first group boundary lies below the nuclide's
+    first grid energy, which is the usual case for a structure starting at
+    0 eV, the index lookup used to collapse nu-fission returns -1 and the
+    integration must not read before the start of the grid.
+
+    U238 is the interesting case because it is fissionable, so the collapse
+    runs the full integration loop, but its fission threshold is around
+    1 MeV. Against a purely thermal flux the answer is therefore exactly
+    zero, and any spurious contribution from below the grid shows up as a
+    nonzero result. O16 does not exercise this path: it is not fissionable
+    and returns early.
+    """
+    chain_file = Path(__file__).parents[1] / 'chain_simple.xml'
+    energies = [0., 6.25e-1, 5.53e3, 8.21e5, 2.e7]
+    flux = [1.0, 0., 0., 0.]
+
+    microxs = MicroXS.from_multigroup_flux(
+        energies=energies, multigroup_flux=flux, chain_file=chain_file,
+        nuclides=['U238'], reactions=['fission', 'nu-fission'])
+
+    assert microxs['U238', 'fission'][0] == 0.0
+    assert microxs['U238', 'nu-fission'][0] == 0.0
+
+
+def test_nu_fission_collapse_lower_bound_invariance():
+    """Extending the lowest group below the grid must not change the result.
+
+    There is no cross section data below the nuclide's first grid energy, so
+    collapsing over [0, 0.625] and over [1e-5, 0.625] with the same flux per
+    eV must give the same answer. Assumes the neutron grid starts at or below
+    1e-5 eV, which holds for the standard libraries.
+    """
+    chain_file = Path(__file__).parents[1] / 'chain_simple.xml'
+    upper = [6.25e-1, 5.53e3, 8.21e5, 2.e7]
+
+    # Both cases give a flux per eV of exactly 1.0 in the lowest group, so a
+    # correct implementation integrates an identical set of segments.
+    from_zero = MicroXS.from_multigroup_flux(
+        energies=[0.] + upper, multigroup_flux=[6.25e-1, 0., 0., 0.],
+        chain_file=chain_file, nuclides=['U235'],
+        reactions=['fission', 'nu-fission'])
+    from_grid = MicroXS.from_multigroup_flux(
+        energies=[1.0e-5] + upper,
+        multigroup_flux=[6.25e-1 - 1.0e-5, 0., 0., 0.],
+        chain_file=chain_file, nuclides=['U235'],
+        reactions=['fission', 'nu-fission'])
+
+    for rxn in ('fission', 'nu-fission'):
+        assert from_zero['U235', rxn][0] == pytest.approx(
+            from_grid['U235', rxn][0], rel=1e-6)
+
+
 def test_microxs_zero_flux():
     chain_file = Path(__file__).parents[1] / 'chain_simple.xml'
 
